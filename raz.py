@@ -533,14 +533,12 @@ def bit_reduction_feasibility(file_path):
     decompress(bytes_read,file_path)
 
 def main():
-
+    # Check if the file path argument is provided
     if len(sys.argv) != 2:
         print("Usage: raz.py <file_path>")
-        file_path = 'ANGELLO.mp3'
+        sys.exit()  # Exit the program if file path is not provided
 
-    else:
-        file_path = sys.argv[1]
-
+    file_path = sys.argv[1]
     bit_reduction_feasibility(file_path)
 
 if __name__ == "__main__":
