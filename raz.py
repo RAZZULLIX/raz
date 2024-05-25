@@ -1,10 +1,36 @@
 from bitarray import bitarray
-import csv
-import math
 import sys
 import struct
 import time
 import gc
+import psutil
+import os
+
+def get_memory_usage():
+    process = psutil.Process(os.getpid())
+    mem_info = process.memory_info()
+    return mem_info.rss  #in bytes
+
+def format_bytes(size):
+    #converts bytes to a human-readable format (KB, MB, GB)
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if size < 1024:
+            return f"{size:.2f} {unit}"
+        size /= 1024
+
+def format_time(time):
+    """Format elapsed time to hh:mm:ss.ff"""
+    hours = int(time // 3600)
+    minutes = int((time % 3600) // 60)
+    seconds = time % 60
+    return f"{hours:02}:{minutes:02}:{seconds:06.3f}"
+
+def print_analysis_info(algo_str, overhead, allscore, expected_savings):
+    overhead_str = format_bytes(overhead)
+    allscore_str = format_bytes(allscore)
+    expected_savings_str = format_bytes(expected_savings)
+
+    print(f"\r{algo_str:<24} overhead: {overhead_str:<11} score: {allscore_str:<11} expected savings: {expected_savings_str:<11} ram used: {format_bytes(get_memory_usage()):<11}",end="\n")
 
 def encode_byte_map_to_256bit(byte_map): #useful to store more than 32 dictionary values in no more than 32bytes
 
@@ -128,7 +154,8 @@ def handle_bit_reduced_data(bytestream, idx, instruction): #this returns the bit
     idx += bit_data_length #increase by bit_data_length because that's the real amount of bytes analyzed from the compressed file, not length
 
     return idx, decompressed, byte_map
-def decompress(bytes_read, file_path):  # the main decompression loop
+
+def decompress(file_path):  #the main decompression loop
     with open(file_path + '.raz', 'rb') as f:
         bytestream = f.read()
 
@@ -228,7 +255,7 @@ def decompress(bytes_read, file_path):  # the main decompression loop
 
             decompressed.extend(decompressed_data)
 
-        elif instruction == 77:  # Handle repeat instruction
+        elif instruction == 77:  #handle repeat instruction
             idx += 1
             byte_to_repeat = bytestream[idx]
             idx += 1
@@ -236,7 +263,7 @@ def decompress(bytes_read, file_path):  # the main decompression loop
             idx += 1
             decompressed.extend([byte_to_repeat] * repeat_count)
 
-        elif instruction == 78:  # Handle repeat instruction
+        elif instruction == 78:  #handle repeat instruction
             idx += 1
             byte_to_repeat = bytestream[idx]
             idx += 1
@@ -253,33 +280,34 @@ def decompress(bytes_read, file_path):  # the main decompression loop
     with open('decompressed_' + file_path, 'wb') as f:
         f.write(bytearray(decompressed))
 
-    print(f'original: {len(decompressed)} compressed: {len(bytestream)} ratio: {len(bytestream) / len(decompressed)}')
-
+    print(f'\nsize data:\noriginal size:\t\t{format_bytes(len(decompressed))}\ncompressed size:\t{format_bytes(len(bytestream))}\ncompression ratio:\t{(len(bytestream) / len(decompressed))*100:.3f}%')
 
 def compress_final(final_compressed, file_path):
-    bytestream = bytearray(b'%RAZv') + bytearray([0, 1]) + bytearray(b'x')  # magic number
+    #eventually i want to huffman or bitreduce the instructions for better compression ratio. also use the 0bit after an instruction to indicate the length of bytes affected
+    #so like (instruction)(affectedbytes)00(3bytelength). 0bits in the right position will make all the important stuff.
+    bytestream = bytearray(b'%RAZv') + bytearray([0, 1]) + bytearray(b'x')  #magic number
     past_instructions = []
     past_byte_maps = []
 
-    for lst in final_compressed:  # write the compressed file according to instructions
+    for lst in final_compressed:  #write the compressed file according to instructions
         instruction = lst[0]
         data = lst[1:]
 
-        if instruction == 10:  # next byte unaffected
+        if instruction == 10:  #next byte unaffected
             bytestream.append(10)
             bytestream.append(data[0])
 
-        elif instruction == 77:  # repeat next byte x times
+        elif instruction == 77:  #repeat next byte x times
             bytestream.append(77)
-            bytestream.append(data[0])  # byte to repeat
-            bytestream.append(data[1])  # repeat count
+            bytestream.append(data[0])  #byte to repeat
+            bytestream.append(data[1])  #repeat count
 
-        elif instruction == 78:  # repeat next byte x times
+        elif instruction == 78:  #repeat next byte x times
             bytestream.append(78)
-            bytestream.append(data[0])  # byte to repeat
-            bytestream.extend(struct.pack(">H",data[1]))  # repeat count
+            bytestream.append(data[0])  #byte to repeat
+            bytestream.extend(struct.pack(">H",data[1]))  #repeat count
 
-        elif instruction == 0:  # next x bytes unaffected
+        elif instruction == 0:  #next x bytes unaffected
             length = len(data)
 
             if length < 256:
@@ -292,7 +320,7 @@ def compress_final(final_compressed, file_path):
                 bytestream.extend(struct.pack(">H", length))
                 bytestream.extend(data)
 
-            else:  # divide into chunks that are smaller than 65536 and bigger than 256 to avoid handling chunks bigger than 64KB
+            else:  #divide into chunks that are smaller than 65536 and bigger than 256 to avoid handling chunks bigger than 64KB
                 total_length = len(data)
                 chunk_size = 65535
 
@@ -304,26 +332,26 @@ def compress_final(final_compressed, file_path):
                     bytestream.extend([41] + list(struct.pack(">H", len(chunk))))
                     bytestream.extend(chunk)
 
-        elif 1 <= instruction <= 7:  # bit reduce this data
+        elif 1 <= instruction <= 7:  #bit reduce this data
             unique_bytes = sorted(list(set(data)))
             original_instruction = instruction
             max_unique_values = min(2 ** instruction, 32)
             go_back = -1
             while len(past_instructions) > 256:
                 past_instructions.pop(0)
-            for ii in range(len(past_instructions), 0, -1):  # check past instructions and maps to see if we can reduce the instruction to 9
+            for ii in range(len(past_instructions), 0, -1):  #check past instructions and maps to see if we can reduce the instruction to 9
                 #this will eventually need to be changed so that it can handle all instructions but only the relevant ones and not calculate randomly that could cause the read of an invalid instruction
                 #also the way it's setup now the instruction can only handle 2byte chunk lengths not 2 bytes goback instructions (like go back 10000)
                 if (past_instructions[ii - 1] == instruction or past_instructions[ii - 1] == instruction + 10 or past_instructions[ii - 1] == instruction - 10) and past_byte_maps[ii - 1] == unique_bytes:
                     go_back = len(past_instructions) - ii
 
-                    if go_back < 256:  # storing go_back in 1 byte 255 is the max value I will go back (for the moment)
+                    if go_back < 256:  #storing go_back in 1 byte 255 is the max value I will go back (for the moment)
                         instruction = 9
                         break
                     else:
-                        go_back = -1  # no need to go back
+                        go_back = -1  #no need to go back
 
-            if go_back == -1:  # normal bit reduction of bytes
+            if go_back == -1:  #normal bit reduction of bytes
                 if len(data) < 256:
                     bytestream.append(instruction)
                     bytestream.append(len(data))
@@ -331,12 +359,12 @@ def compress_final(final_compressed, file_path):
                     bytestream.append(instruction + 10)
                     bytestream.extend(list(struct.pack(">H", len(data))))
                 else:
-                    print('omg!')  # omg isn't a very good way to handle this case
+                    print('omg!')  #omg isn't a very good way to handle this case
 
-                if len(unique_bytes) > 32:  # encode in 256bits byte maps larger than 32
+                if len(unique_bytes) > 32:  #encode in 256bits byte maps larger than 32
                     unique_bytes_packed = encode_byte_map_to_256bit(unique_bytes)
                     bytestream.extend(unique_bytes_packed)
-                elif len(unique_bytes) < max_unique_values:  # double last map value to truncate it before max length
+                elif len(unique_bytes) < max_unique_values:  #double last map value to truncate it before max length
                     unique_bytes.append(unique_bytes[-1])
                     bytestream.extend(unique_bytes)
                 else:
@@ -345,7 +373,7 @@ def compress_final(final_compressed, file_path):
                 past_instructions.append(instruction)
                 past_byte_maps.append(unique_bytes)
 
-            else:  # if instruction is already present
+            else:  #if instruction is already present
                 if len(data) < 256:
                     bytestream.append(instruction)
                     bytestream.append(go_back)
@@ -356,34 +384,33 @@ def compress_final(final_compressed, file_path):
                     bytestream.append(go_back)
                     bytestream.extend(list(struct.pack(">H", len(data))))
                 else:
-                    print('omg!')  # bah
+                    print('omg!')  #bah
 
-                if original_instruction < 10:  # return the right instruction to encode data
+                if original_instruction < 10:  #return the right instruction to encode data
                     instruction = original_instruction
                 else:
                     instruction = original_instruction - 10
 
             byte_map = {}
-            for idx, byte in enumerate(unique_bytes):  # build byte map
+            for idx, byte in enumerate(unique_bytes):  #build byte map
                 byte_map[byte] = idx
 
-            if len(unique_bytes) > 2 and unique_bytes[-1] == unique_bytes[-2]:  # handle truncated byte map
+            if len(unique_bytes) > 2 and unique_bytes[-1] == unique_bytes[-2]:  #handle truncated byte map
                 byte_map[unique_bytes[-2]] = len(unique_bytes) - 2
 
             packed_data = []
-            for byte in data:  # write bit reduced data after mapping
+            for byte in data:  #write bit reduced data after mapping
                 value_to_write = byte_map[byte]
                 packed_data.extend(format(value_to_write, f'0{instruction}b'))
 
-            while len(packed_data) % 8 != 0:  # append 0 bits if value ends before end of byte
+            while len(packed_data) % 8 != 0:  #append 0 bits if value ends before end of byte
                 packed_data.append('0')
 
-            for i in range(0, len(packed_data), 8):  # add packed data to the bytestream
+            for i in range(0, len(packed_data), 8):  #add packed data to the bytestream
                 bytestream.append(int("".join(packed_data[i:i + 8]), 2))
 
     with open(file_path + '.raz', 'wb') as f:
         f.write(bytestream)
-
         
 length_thresholds = {1: 11, 2: 15, 3: 24, 4: 43, 5: 81, 6: 159, 7: 319}
 unique_byte_thresholds = {1: 2, 2: 4, 3: 8, 4: 16, 5: 32, 6: 64, 7: 128}    
@@ -392,32 +419,54 @@ multipliers = {1: 0.125, 2: 0.25, 3: 0.375, 4: 0.5, 5: 0.625, 6: 0.75, 7: 0.875}
 def calculate_scores(bytes_list, reduction): #scoring can ignore thresholds if keep track of all instructions and maps in the method
 
     row = []
-    for start_pos in range(len(bytes_list)):
+    len_bytes = len(bytes_list)
+    interval = len_bytes / 10000  #1/10000th of the file size
+    next_print = interval  #the next position to print progress
+    start_time = time.time()
+    last_update_time = start_time
+    unique_byte_threshold = unique_byte_thresholds[reduction]
+    length_threshold = length_thresholds[reduction]
     
+    for start_pos in range(len_bytes): 
+        if start_pos >= next_print:
+            current_time = time.time()
+            if current_time - last_update_time >= 0.1:
+                printthis = start_pos / len_bytes * 100
+                print(f"\r{reduction}bit redux analysis in progress: {printthis:.2f}%", end="")
+                sys.stdout.flush()
+                next_print += interval  #update the next print position
+                last_update_time = current_time  #update the last update time
+
         if isinstance(bytes_list[start_pos], list): #if it's a list it's already compressed. THIS WILL BE THE PART WHERE THE 9 INSTRUCTION WILL BE USED TO COMPRESS BACKGROUND DATA
             row.append(0)
             continue
     
         max_length = 0
         unique_bytes = set()
+
+        #TODO: first check if the reduction is possible by checking the unique bytes in the mimimum length threshold
+        #then if that's so have the for loop start from the threshold going on
+
+        for end_pos in range(start_pos, min(len_bytes,start_pos+65535)):
+            last_checked_byte = bytes_list[end_pos]
     
-        for end_pos in range(start_pos, min(len(bytes_list),start_pos+65535)): 
-    
-            if isinstance(bytes_list[end_pos], list):
+            if isinstance(last_checked_byte, list):
                 break
     
-            unique_bytes.add(bytes_list[end_pos])
+            unique_bytes.add(last_checked_byte)
     
-            if len(unique_bytes) > unique_byte_thresholds[reduction]:
+            if len(unique_bytes) > unique_byte_threshold:
                 break
     
             max_length += 1
         
-        if max_length >= length_thresholds[reduction]:
+        if max_length >= length_threshold:
             row.append(max_length) #is max length the best scoring possible?
     
         else:
             row.append(0)
+            
+    print(f"\r{reduction}bit redux analysis done! reducing...              ", end="")
     
     return row
 
@@ -425,7 +474,6 @@ def bit_reduction(less_bit_compressed, bits):
 
     more_bit_scores = calculate_scores(less_bit_compressed, bits)
 
-    to_append = []
     more_bit_compressed = []
     overhead = 0
     allscore = 0
@@ -446,7 +494,6 @@ def bit_reduction(less_bit_compressed, bits):
 
             else:
                 more_bit_compressed.append( [bits] + list(less_bit_compressed[i:i+score]))
-                to_append = []
                 i += score - 1
 
         else:
@@ -454,7 +501,8 @@ def bit_reduction(less_bit_compressed, bits):
 
         i += 1
 
-    print(str(bits)+' bits done!\tOverhead: '+str(overhead)+'\t\tScore: '+str(allscore)+'\t\tExpected savings: '+str(allscore-overhead-int(allscore*(.125*bits))))
+    expected_savings = allscore-overhead-int(allscore*(.125*bits))
+    print_analysis_info(str(bits) +'bit redux done!',overhead,allscore,expected_savings)
 
     return more_bit_compressed
 
@@ -488,43 +536,62 @@ def mark_uncompressed(data):
         marked_data.append(prefix + current_marked_sublist)
 
     return marked_data
-
+    
 def handle_repeats(data):
     compressed = []
     i = 0
     allscore = 0
     overhead = 0
+    len_data = len(data)
+    interval = len_data / 10000  #1/10000th of the file size
+    next_print = interval  #the next position to print progress
+    start_time = time.time()
+    last_update_time = start_time
 
-    while i < len(data):
+    while i < len_data:
+
+        if i >= next_print:
+            current_time = time.time()
+
+            if current_time - last_update_time >= 0.1:
+                printthis = i / len_data * 100
+                print(f"\rrepeats analysis in progress: {printthis:.2f}%", end="")
+                sys.stdout.flush()
+                next_print += interval  #update the next print position
+                last_update_time = current_time  #update the last update time
+
         if isinstance(data[i], list):
             compressed.append(data[i])
             i += 1
             continue
         
         repeat_count = 1
-        while i + repeat_count < len(data) and data[i] == data[i + repeat_count] and repeat_count < 65535:
+
+        while i + repeat_count < len_data and data[i] == data[i + repeat_count] and repeat_count < 65535:
             repeat_count += 1
 
-        if repeat_count > 3:  # Choose a threshold for when it's beneficial to use the repeat instruction
+        if repeat_count > 3:  #choose a threshold for when it's beneficial to use the repeat instruction
             
             if repeat_count < 255:
                 compressed.append([77, data[i], repeat_count])
                 i += repeat_count
                 allscore += repeat_count
-                overhead += 2  # 1 byte for the byte to repeat and 1 byte for the repeat count
+                overhead += 2  #1 byte for the byte to repeat and 1 byte for the repeat count
 
             else:
                 compressed.append([78, data[i], repeat_count])
                 i += repeat_count
                 allscore += repeat_count
-                overhead += 3  # 1 byte for the byte to repeat and 1 byte for the repeat count
+                overhead += 3  #1 byte for the byte to repeat and 2 bytes for the repeat count
 
-                
         else:
             compressed.append(data[i])
             i += 1
 
-    print('repeats done!\tOverhead: ' + str(overhead) + '\t\tScore: ' + str(allscore) + '\t\tExpected savings: ' + str(allscore - overhead))
+    expected_savings = allscore - overhead
+    print(f"\rrepeats analysis done! repeating...            ", end="")
+    
+    print_analysis_info('repeats done!',overhead,allscore,expected_savings)
 
     return compressed
 
@@ -532,42 +599,61 @@ def bit_reduction_feasibility(file_path):
     start_time = time.time()  
 
     with open(file_path, 'rb') as f:
-        bytes_read = f.read()
+        original_data = f.read()
 
-    wip_bytes = handle_repeats(bytes_read)
-    gc.collect() #when trying to compress larger files memory usage can get out of hand so I manually garbace collect to keep memory usage lower. need to improve memory usage and file chunking.
-    wip_bytes = bit_reduction(wip_bytes, 1)
+    print(f"\ncompressing {file_path} now...         \n")
+
+    data = original_data
+    
+    #---
+    #---
+    #pass a list of commands through argument and use them in the order they are given and only those that are given.
+    #---
+    #---
+
+    data = handle_repeats(data)
+    gc.collect() #when trying to compress larger files memory usage can get out of hand so I manually garbage collect to keep memory usage lower. need to improve memory usage and file chunking.
+
+    data = bit_reduction(data, 1)
     gc.collect()
-    wip_bytes = bit_reduction(wip_bytes, 2)
+
+    data = bit_reduction(data, 2)
     gc.collect()
-    wip_bytes = bit_reduction(wip_bytes, 3)
+
+    data = bit_reduction(data, 3)
     gc.collect()
-    wip_bytes = bit_reduction(wip_bytes, 4)
+
+    data = bit_reduction(data, 4)
     gc.collect()
-    wip_bytes = bit_reduction(wip_bytes, 5)
+
+    data = bit_reduction(data, 5)
     gc.collect()
-    wip_bytes = bit_reduction(wip_bytes, 6)
+
+    data = bit_reduction(data, 6)
     gc.collect()
-    wip_bytes = bit_reduction(wip_bytes, 7)
+
+    data = bit_reduction(data, 7)
     gc.collect()
-    final_compressed = mark_uncompressed(wip_bytes)
+
+    final_compressed = mark_uncompressed(data)
 
     end_time = time.time()
     elapsed_time = end_time - start_time
-    print(f"analysis time: {elapsed_time:.2f} seconds")
+    analysis_time_str = (f"analysis time:\t\t{format_time(elapsed_time)}")
 
     start_time = time.time()
     compress_final(final_compressed, file_path)
     end_time = time.time()
     elapsed_time = end_time - start_time
-    print(f"compression time: {elapsed_time:.2f} seconds")
+    compression_time_str = (f"compression time:\t{format_time(elapsed_time)}")
 
     start_time = time.time()
-    decompress(bytes_read, file_path)
+    decompress(file_path)
     end_time = time.time()
     elapsed_time = end_time - start_time
-    print(f"decompression time: {elapsed_time:.2f} seconds")
-
+    decompression_time_str = (f"decompression time:\t{format_time(elapsed_time)}")
+    
+    print(f"\ntimes:\n{analysis_time_str}\n{compression_time_str}\n{decompression_time_str}\n\ntest completed successfully!")
 
 def main():
     #check if the file path argument is provided
