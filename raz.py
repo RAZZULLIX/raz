@@ -1,10 +1,12 @@
 from bitarray import bitarray
-import sys
-import struct
-import time
 import gc
-import psutil
+from multiprocessing import Pool, cpu_count
+import numpy as np
 import os
+import psutil
+import struct
+import sys
+import time
 
 def get_memory_usage():
     process = psutil.Process(os.getpid())
@@ -337,11 +339,14 @@ def compress_final(final_compressed, file_path):
             original_instruction = instruction
             max_unique_values = min(2 ** instruction, 32)
             go_back = -1
+
             while len(past_instructions) > 256:
                 past_instructions.pop(0)
+
             for ii in range(len(past_instructions), 0, -1):  #check past instructions and maps to see if we can reduce the instruction to 9
                 #this will eventually need to be changed so that it can handle all instructions but only the relevant ones and not calculate randomly that could cause the read of an invalid instruction
                 #also the way it's setup now the instruction can only handle 2byte chunk lengths not 2 bytes goback instructions (like go back 10000)
+
                 if (past_instructions[ii - 1] == instruction or past_instructions[ii - 1] == instruction + 10 or past_instructions[ii - 1] == instruction - 10) and past_byte_maps[ii - 1] == unique_bytes:
                     go_back = len(past_instructions) - ii
 
@@ -355,18 +360,22 @@ def compress_final(final_compressed, file_path):
                 if len(data) < 256:
                     bytestream.append(instruction)
                     bytestream.append(len(data))
+
                 elif len(data) < 65536:
                     bytestream.append(instruction + 10)
                     bytestream.extend(list(struct.pack(">H", len(data))))
+
                 else:
                     print('omg!')  #omg isn't a very good way to handle this case
 
                 if len(unique_bytes) > 32:  #encode in 256bits byte maps larger than 32
                     unique_bytes_packed = encode_byte_map_to_256bit(unique_bytes)
                     bytestream.extend(unique_bytes_packed)
+                    
                 elif len(unique_bytes) < max_unique_values:  #double last map value to truncate it before max length
                     unique_bytes.append(unique_bytes[-1])
                     bytestream.extend(unique_bytes)
+
                 else:
                     bytestream.extend(unique_bytes)
 
@@ -378,16 +387,19 @@ def compress_final(final_compressed, file_path):
                     bytestream.append(instruction)
                     bytestream.append(go_back)
                     bytestream.append(len(data))
+
                 elif len(data) < 65536:
                     instruction += 10
                     bytestream.append(instruction)
                     bytestream.append(go_back)
                     bytestream.extend(list(struct.pack(">H", len(data))))
+
                 else:
                     print('omg!')  #bah
 
                 if original_instruction < 10:  #return the right instruction to encode data
                     instruction = original_instruction
+
                 else:
                     instruction = original_instruction - 10
 
@@ -399,6 +411,7 @@ def compress_final(final_compressed, file_path):
                 byte_map[unique_bytes[-2]] = len(unique_bytes) - 2
 
             packed_data = []
+
             for byte in data:  #write bit reduced data after mapping
                 value_to_write = byte_map[byte]
                 packed_data.extend(format(value_to_write, f'0{instruction}b'))
@@ -416,59 +429,39 @@ length_thresholds = {1: 11, 2: 15, 3: 24, 4: 43, 5: 81, 6: 159, 7: 319}
 unique_byte_thresholds = {1: 2, 2: 4, 3: 8, 4: 16, 5: 32, 6: 64, 7: 128}    
 multipliers = {1: 0.125, 2: 0.25, 3: 0.375, 4: 0.5, 5: 0.625, 6: 0.75, 7: 0.875}
 
-def calculate_scores(bytes_list, reduction): #scoring can ignore thresholds if keep track of all instructions and maps in the method
-
-    row = []
-    len_bytes = len(bytes_list)
-    interval = len_bytes / 10000  #1/10000th of the file size
-    next_print = interval  #the next position to print progress
-    start_time = time.time()
-    last_update_time = start_time
-    unique_byte_threshold = unique_byte_thresholds[reduction]
-    length_threshold = length_thresholds[reduction]
-    
-    for start_pos in range(len_bytes): 
-        if start_pos >= next_print:
-            current_time = time.time()
-            if current_time - last_update_time >= 0.1:
-                printthis = start_pos / len_bytes * 100
-                print(f"\r{reduction}bit redux analysis in progress: {printthis:.2f}%", end="")
-                sys.stdout.flush()
-                next_print += interval  #update the next print position
-                last_update_time = current_time  #update the last update time
-
-        if isinstance(bytes_list[start_pos], list): #if it's a list it's already compressed. THIS WILL BE THE PART WHERE THE 9 INSTRUCTION WILL BE USED TO COMPRESS BACKGROUND DATA
-            row.append(0)
-            continue
-    
-        max_length = 0
+def calculate_scores_chunk(chunk, unique_byte_threshold, length_threshold):
+    row_chunk = np.zeros(len(chunk), dtype=int)
+    for start_pos in range(len(chunk)):
         unique_bytes = set()
-
-        #TODO: first check if the reduction is possible by checking the unique bytes in the mimimum length threshold
-        #then if that's so have the for loop start from the threshold going on
-
-        for end_pos in range(start_pos, min(len_bytes,start_pos+65535)):
-            last_checked_byte = bytes_list[end_pos]
-    
+        max_length = 0
+        for end_pos in range(start_pos, min(len(chunk), start_pos + 65535)):
+            last_checked_byte = chunk[end_pos]
             if isinstance(last_checked_byte, list):
                 break
-    
             unique_bytes.add(last_checked_byte)
-    
             if len(unique_bytes) > unique_byte_threshold:
                 break
-    
             max_length += 1
-        
         if max_length >= length_threshold:
-            row.append(max_length) #is max length the best scoring possible?
-    
-        else:
-            row.append(0)
-            
+            row_chunk[start_pos] = max_length
+    return row_chunk
+
+def calculate_scores(bytes_list, reduction):
+    print(f"\r{reduction}bit redux analysis in progress...", end="")
+    len_bytes = len(bytes_list)
+    unique_byte_threshold = unique_byte_thresholds[reduction]
+    length_threshold = length_thresholds[reduction]
+
+    num_workers = cpu_count()
+    chunk_size = len_bytes // num_workers + 1
+    chunks = [bytes_list[i:i + chunk_size] for i in range(0, len_bytes, chunk_size)]
+
+    with Pool(num_workers) as pool:
+        results = pool.starmap(calculate_scores_chunk, [(chunk, unique_byte_threshold, length_threshold) for chunk in chunks])
+
+    scores = np.concatenate(results)
     print(f"\r{reduction}bit redux analysis done! reducing...              ", end="")
-    
-    return row
+    return scores
 
 def bit_reduction(less_bit_compressed, bits):
 
@@ -506,6 +499,70 @@ def bit_reduction(less_bit_compressed, bits):
 
     return more_bit_compressed
 
+
+    
+def handle_repeats_chunk(chunk):
+    compressed = []
+    allscore = 0
+    overhead = 0
+    i = 0
+    len_chunk = len(chunk)
+
+    while i < len_chunk:
+        if isinstance(chunk[i], list):
+            compressed.append(chunk[i])
+            i += 1
+            continue
+
+        repeat_count = 1
+
+        while i + repeat_count < len_chunk and chunk[i] == chunk[i + repeat_count] and repeat_count < 65535:
+            repeat_count += 1
+
+        if repeat_count > 3:  # choose a threshold for when it's beneficial to use the repeat instruction
+            if repeat_count < 255:
+                compressed.append([77, chunk[i], repeat_count])
+                i += repeat_count
+                allscore += repeat_count
+                overhead += 2  # 1 byte for the byte to repeat and 1 byte for the repeat count
+            else:
+                compressed.append([78, chunk[i], repeat_count])
+                i += repeat_count
+                allscore += repeat_count
+                overhead += 3  # 1 byte for the byte to repeat and 2 bytes for the repeat count
+        else:
+            compressed.append(chunk[i])
+            i += 1
+
+    return compressed, allscore, overhead
+
+def handle_repeats(data):
+    len_data = len(data)
+
+    num_workers = cpu_count()
+    chunk_size = len_data // num_workers + 1
+    chunks = [data[i:i + chunk_size] for i in range(0, len_data, chunk_size)]
+
+    with Pool(num_workers) as pool:
+        results = pool.map(handle_repeats_chunk, chunks)
+
+    compressed = []
+    allscore = 0
+    overhead = 0
+
+    for result in results:
+        chunk_compressed, chunk_allscore, chunk_overhead = result
+        compressed.extend(chunk_compressed)
+        allscore += chunk_allscore
+        overhead += chunk_overhead
+
+    expected_savings = allscore - overhead
+    print(f"\rrepeats analysis done! repeating...            ", end="")
+    
+    print_analysis_info('repeats done!', overhead, allscore, expected_savings)
+
+    return compressed
+
 def mark_uncompressed(data):
 
     marked_data = []
@@ -536,66 +593,8 @@ def mark_uncompressed(data):
         marked_data.append(prefix + current_marked_sublist)
 
     return marked_data
-    
-def handle_repeats(data):
-    compressed = []
-    i = 0
-    allscore = 0
-    overhead = 0
-    len_data = len(data)
-    interval = len_data / 10000  #1/10000th of the file size
-    next_print = interval  #the next position to print progress
-    start_time = time.time()
-    last_update_time = start_time
 
-    while i < len_data:
-
-        if i >= next_print:
-            current_time = time.time()
-
-            if current_time - last_update_time >= 0.1:
-                printthis = i / len_data * 100
-                print(f"\rrepeats analysis in progress: {printthis:.2f}%", end="")
-                sys.stdout.flush()
-                next_print += interval  #update the next print position
-                last_update_time = current_time  #update the last update time
-
-        if isinstance(data[i], list):
-            compressed.append(data[i])
-            i += 1
-            continue
-        
-        repeat_count = 1
-
-        while i + repeat_count < len_data and data[i] == data[i + repeat_count] and repeat_count < 65535:
-            repeat_count += 1
-
-        if repeat_count > 3:  #choose a threshold for when it's beneficial to use the repeat instruction
-            
-            if repeat_count < 255:
-                compressed.append([77, data[i], repeat_count])
-                i += repeat_count
-                allscore += repeat_count
-                overhead += 2  #1 byte for the byte to repeat and 1 byte for the repeat count
-
-            else:
-                compressed.append([78, data[i], repeat_count])
-                i += repeat_count
-                allscore += repeat_count
-                overhead += 3  #1 byte for the byte to repeat and 2 bytes for the repeat count
-
-        else:
-            compressed.append(data[i])
-            i += 1
-
-    expected_savings = allscore - overhead
-    print(f"\rrepeats analysis done! repeating...            ", end="")
-    
-    print_analysis_info('repeats done!',overhead,allscore,expected_savings)
-
-    return compressed
-
-def bit_reduction_feasibility(file_path):
+def algorithm_score_analysis(file_path):
     start_time = time.time()  
 
     with open(file_path, 'rb') as f:
@@ -662,7 +661,7 @@ def main():
         sys.exit()  #exit the program if file path is not provided
 
     file_path = sys.argv[1]
-    bit_reduction_feasibility(file_path)
+    algorithm_score_analysis(file_path)
 
 if __name__ == "__main__":
     main()
