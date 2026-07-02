@@ -366,7 +366,7 @@ def compress_final(final_compressed, file_path):
                     bytestream.extend(list(struct.pack(">H", len(data))))
 
                 else:
-                    print('omg!')  #omg isn't a very good way to handle this case
+                    print('wow!')  #wow isn't a very good way to handle this case
 
                 if len(unique_bytes) > 32:  #encode in 256bits byte maps larger than 32
                     unique_bytes_packed = encode_byte_map_to_256bit(unique_bytes)
@@ -395,7 +395,7 @@ def compress_final(final_compressed, file_path):
                     bytestream.extend(list(struct.pack(">H", len(data))))
 
                 else:
-                    print('omg!')  #bah
+                    print('wow!')  #bah
 
                 if original_instruction < 10:  #return the right instruction to encode data
                     instruction = original_instruction
